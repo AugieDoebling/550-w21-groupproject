@@ -29,6 +29,13 @@ const (
 	VoteNo  = 2
 )
 
+const (
+	Create = 0
+	Delete = 1
+	Write  = 2
+	Chmod  = 3
+)
+
 type FileServerNode struct {
 	id               int
 	election_timeout int
@@ -41,7 +48,13 @@ type FileServerNode struct {
 }
 
 type EntryLog struct {
-	id    int
+	Id        int
+	FileName  string
+	FilePath  string
+	EventType int
+	NodeID    int
+	IpAddress string
+
 	Term  int
 	Index int
 }
@@ -206,6 +219,23 @@ func sendHeartbeatWhenLeader(node *FileServerNode) {
 	}
 }
 
+// each node watches for changes and notifies leader when relevant change occurs
+// leader writes the change to the log
+
+// todo
+// leader change listener - augie
+// finish watcher - nicks
+// get ip address for the pi's and store that to the logs - nicks
+// method to call leader change (writes the log) from the node with a change
+// node get changes listener - augie
+// node get changes client - with file transfer - augie
+
+// todo continuing / strech
+// file transfer encryption
+// chmod command
+// merge conflicts
+// file server capability - load balancer out of the leader
+
 func watchForChanges(directory string) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -226,6 +256,34 @@ func watchForChanges(directory string) {
 					log.Println("modified file:", event.Name)
 					// We add RPC functions to commit file change logs to leader
 				}
+				if event.Op&fsnotify.Remove == fsnotify.Remove {
+					log.Println("deleted file :", event.Name)
+					// We need to check if the path is outside working directory
+					// fileStat, err := os.Stat(event.Name)
+					// if err != nil {
+					// 	log.Println(err)
+					// }
+
+				}
+				if event.Op&fsnotify.Create == fsnotify.Create {
+					log.Println("modified file:", event.Name)
+					fileStat, err := os.Stat(event.Name)
+					if err != nil {
+						log.Println(err)
+					}
+
+					// fmt.Println("File Name:", fileStat.Name())        // Base name of the file
+					// fmt.Println("Size:", fileStat.Size())             // Length in bytes for regular files
+					// fmt.Println("Permissions:", fileStat.Mode())      // File mode bits
+					// fmt.Println("Last Modified:", fileStat.ModTime()) // Last modification time
+
+					fmt.Println("Is Directory: ", fileStat.IsDir())
+					if fileStat.IsDir() {
+						watcher.Add(event.Name)
+					}
+					// We add RPC functions to commit file change logs to leader
+				}
+
 			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
@@ -261,7 +319,7 @@ func createNode(listenPort int) {
 
 	// go WatchTimer(node)
 	// go sendHeartbeatWhenLeader(node)
-	go watchForChanges("/datadirectory")
+	go watchForChanges("./datadirectory")
 
 	rpc.Register(node)
 	rpc.HandleHTTP()
@@ -272,9 +330,12 @@ func createNode(listenPort int) {
 
 // https://github.com/fsnotify/fsnotify
 
+// https://github.com/radovskyb/watcher
+
 // https://medium.com/@skdomino/watch-this-file-watching-in-go-5b5a247cf71f
 
 func main() {
+	log.SetFlags(log.Lmicroseconds)
 	rand.Seed(time.Now().UnixNano())
 
 	listenPort := 9000
