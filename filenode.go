@@ -8,6 +8,7 @@ import (
 	"net/rpc"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -45,6 +46,9 @@ type FileServerNode struct {
 	timeout_ticker   time.Ticker
 	received_hb      bool
 	logs             []EntryLog
+
+	dataDirectory string
+	changeIgnore  map[string]bool
 }
 
 type EntryLog struct {
@@ -219,6 +223,152 @@ func sendHeartbeatWhenLeader(node *FileServerNode) {
 	}
 }
 
+type FileMessage struct {
+	FileName string
+	Data     []byte
+}
+
+func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) error {
+	println("received file - name", file.FileName, "data - ", string(file.Data))
+	*reply = 1
+
+	// os.Wr
+	filePath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, file.FileName)
+
+	ignoreNextChange(node, filePath)
+
+	writeErr := os.WriteFile(filePath, file.Data, 0644)
+	if writeErr != nil {
+		*reply = 0
+		println("Unable to write to file", filePath, writeErr)
+	}
+
+	return nil
+
+}
+
+func sendFile(node *FileServerNode, fileName string) {
+
+	var readErr error
+	var message = FileMessage{
+		FileName: getRelativeFileName(node, fileName),
+	}
+
+	// read file contents
+	message.Data, readErr = os.ReadFile(fileName)
+	if readErr != nil {
+		println("UNABLE TO READ FILE", fileName)
+		return
+	}
+
+	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
+	if httpError != nil {
+		println("could not communicate with node - ")
+		return
+	}
+	res := 0
+
+	receiveErr := client.Call("FileServerNode.ReceiveCreateFile", message, &res)
+	if receiveErr != nil || res != 1 {
+		println("error while sending file")
+		return
+	}
+}
+
+func getRelativeFileName(node *FileServerNode, filename string) string {
+	return strings.Replace(filename, node.dataDirectory+"/", "", 1)
+}
+
+func (node *FileServerNode) ReceiveDeleteFile(fileName string, reply *int) error {
+	println("deleting file at", fileName)
+
+	*reply = 1
+
+	// os.Wr
+	filePath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, fileName)
+
+	ignoreNextChange(node, filePath)
+
+	deleteErr := os.Remove(filePath)
+	if deleteErr != nil {
+		*reply = 0
+		println("Unable to delete file", filePath, deleteErr.Error())
+	}
+
+	return nil
+}
+
+func deleteFile(node *FileServerNode, fileName string) {
+
+	relativeFileName := getRelativeFileName(node, fileName)
+
+	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
+	if httpError != nil {
+		println("could not communicate with node - ")
+		return
+	}
+	res := 0
+
+	receiveErr := client.Call("FileServerNode.ReceiveDeleteFile", relativeFileName, &res)
+	if receiveErr != nil || res != 1 {
+		println("error while deleting file")
+		return
+	}
+
+}
+
+func (node *FileServerNode) ReceiveCreateDirectory(dir string, reply *int) error {
+	println("creating directory at", dir)
+
+	*reply = 1
+
+	// os.Wr
+	dirPath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, dir)
+
+	ignoreNextChange(node, dirPath)
+
+	mkdirErr := os.Mkdir(dirPath, 0755)
+	// deleteErr := os.Remove(filePath)
+	if mkdirErr != nil {
+		*reply = 0
+		println("Unable to create directory", dirPath, mkdirErr.Error())
+	}
+
+	return nil
+}
+
+func createDirectory(node *FileServerNode, dir string) {
+	relativeDirName := getRelativeFileName(node, dir)
+
+	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
+	if httpError != nil {
+		println("could not communicate with node - ")
+		return
+	}
+	res := 0
+
+	receiveErr := client.Call("FileServerNode.ReceiveCreateDirectory", relativeDirName, &res)
+	if receiveErr != nil || res != 1 {
+		println("error while creating directory")
+		return
+	}
+
+}
+
+func ignoreNextChange(node *FileServerNode, filePath string) {
+	node.changeIgnore[filePath] = true
+}
+
+func ignoreExists(node *FileServerNode, filePath string) bool {
+	ignore, present := node.changeIgnore[filePath]
+
+	if ignore {
+		node.changeIgnore[filePath] = false
+	}
+
+	return ignore && present
+}
+
 // each node watches for changes and notifies leader when relevant change occurs
 // leader writes the change to the log
 
@@ -236,7 +386,7 @@ func sendHeartbeatWhenLeader(node *FileServerNode) {
 // merge conflicts
 // file server capability - load balancer out of the leader
 
-func watchForChanges(directory string) {
+func watchForChanges(node *FileServerNode) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
@@ -251,13 +401,33 @@ func watchForChanges(directory string) {
 				if !ok {
 					return
 				}
-				log.Println("event:", event)
+				// log.Println("event:", event)
+
+				// ignore all filename starting with .
+				if strings.HasPrefix(event.Name, ".") {
+					println("ignoring event for file", event.Name)
+					continue
+				}
+
+				// if not chmod
+				if event.Op&fsnotify.Chmod != fsnotify.Chmod {
+					if ignoreExists(node, event.Name) {
+						println("found ignore for ", event.Name)
+						continue
+					}
+					println("did not find ignore for", event.Name)
+
+				}
+
 				if event.Op&fsnotify.Write == fsnotify.Write {
-					log.Println("modified file:", event.Name)
+					// log.Println("modified file:", event.Name)
+					println("*** WRITE -", event.Name)
 					// We add RPC functions to commit file change logs to leader
+					sendFile(node, event.Name)
 				}
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
-					log.Println("deleted file :", event.Name)
+					println("*** DELETE -", event.Name)
+					deleteFile(node, event.Name)
 					// We need to check if the path is outside working directory
 					// fileStat, err := os.Stat(event.Name)
 					// if err != nil {
@@ -266,7 +436,7 @@ func watchForChanges(directory string) {
 
 				}
 				if event.Op&fsnotify.Create == fsnotify.Create {
-					log.Println("modified file:", event.Name)
+					println("*** CREATE -", event.Name)
 					fileStat, err := os.Stat(event.Name)
 					if err != nil {
 						log.Println(err)
@@ -280,7 +450,11 @@ func watchForChanges(directory string) {
 					fmt.Println("Is Directory: ", fileStat.IsDir())
 					if fileStat.IsDir() {
 						watcher.Add(event.Name)
+						createDirectory(node, event.Name)
+					} else {
+						sendFile(node, event.Name)
 					}
+
 					// We add RPC functions to commit file change logs to leader
 				}
 
@@ -293,14 +467,14 @@ func watchForChanges(directory string) {
 		}
 	}()
 
-	err = watcher.Add(directory)
+	err = watcher.Add(node.dataDirectory)
 	if err != nil {
 		log.Fatal(err)
 	}
 	<-done
 }
 
-func createNode(listenPort int) {
+func createNode(listenPort int, dataDirectory string) {
 	node := new(FileServerNode)
 	node.status = Follower
 	// set the leader as uninitialized
@@ -317,9 +491,13 @@ func createNode(listenPort int) {
 		},
 	}
 
+	node.changeIgnore = make(map[string]bool)
+
+	node.dataDirectory = dataDirectory
+
 	// go WatchTimer(node)
 	// go sendHeartbeatWhenLeader(node)
-	go watchForChanges("./datadirectory")
+	go watchForChanges(node)
 
 	rpc.Register(node)
 	rpc.HandleHTTP()
@@ -339,11 +517,21 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	listenPort := 9000
+	dataDir := ""
+
+	println(len(os.Args))
 
 	if len(os.Args) == 2 {
-		listenPort, _ = strconv.Atoi(os.Args[1])
+		dataDir = os.Args[1]
+	} else if len(os.Args) == 3 {
+		dataDir = os.Args[1]
+		listenPort, _ = strconv.Atoi(os.Args[2])
+	} else {
+		println("usage : go run filenode.go <data_directory> <listener_port>")
+		os.Exit(0)
 	}
 
 	println("Starting node listening on port:", listenPort)
-	createNode(listenPort)
+	println("data directory : ", dataDir)
+	createNode(listenPort, dataDir)
 }
