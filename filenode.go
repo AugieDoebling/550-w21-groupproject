@@ -386,7 +386,10 @@ func ignoreExists(node *FileServerNode, filePath string) bool {
 
 // encryption
 func initEncryption(node *FileServerNode) {
-	key := []byte("augiedoebling123")
+	key, readErr := os.ReadFile("encryptionkey.txt")
+	if readErr != nil {
+		panic("UNABLE TO READ ENCRYPTION KEY")
+	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
