@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"math/rand"
@@ -49,6 +52,10 @@ type FileServerNode struct {
 
 	dataDirectory string
 	changeIgnore  map[string]bool
+
+	//encryption
+	gcm       cipher.AEAD
+	nonceSize int
 }
 
 type EntryLog struct {
@@ -237,7 +244,13 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 
 	ignoreNextChange(node, filePath)
 
-	writeErr := os.WriteFile(filePath, file.Data, 0644)
+	decryptedData, decryptErr := decrypt(node, file.Data)
+	if decryptErr != nil {
+		*reply = 0
+		println("Unable to decrypt data")
+	}
+
+	writeErr := os.WriteFile(filePath, decryptedData, 0644)
 	if writeErr != nil {
 		*reply = 0
 		println("Unable to write to file", filePath, writeErr)
@@ -255,11 +268,13 @@ func sendFile(node *FileServerNode, fileName string) {
 	}
 
 	// read file contents
-	message.Data, readErr = os.ReadFile(fileName)
+	rawFileData, readErr := os.ReadFile(fileName)
 	if readErr != nil {
 		println("UNABLE TO READ FILE", fileName)
 		return
 	}
+
+	message.Data = encrypt(node, rawFileData)
 
 	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
 	if httpError != nil {
@@ -367,6 +382,48 @@ func ignoreExists(node *FileServerNode, filePath string) bool {
 	}
 
 	return ignore && present
+}
+
+// encryption
+func initEncryption(node *FileServerNode) {
+	key := []byte("augiedoebling123")
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		fmt.Printf("Error reading key: %s\n", err.Error())
+		os.Exit(1)
+	}
+
+	fmt.Printf("Key: %s\n", hex.EncodeToString(key))
+
+	node.gcm, err = cipher.NewGCM(block)
+	if err != nil {
+		fmt.Printf("Error initializing AEAD: %s\n", err.Error())
+		os.Exit(1)
+	}
+
+	node.nonceSize = node.gcm.NonceSize()
+}
+
+func randBytes(length int) []byte {
+	b := make([]byte, length)
+	rand.Read(b)
+	return b
+}
+
+func encrypt(node *FileServerNode, plaintext []byte) (ciphertext []byte) {
+	nonce := randBytes(node.nonceSize)
+	c := node.gcm.Seal(nil, nonce, plaintext, nil)
+	return append(nonce, c...)
+}
+
+func decrypt(node *FileServerNode, ciphertext []byte) (plaintext []byte, err error) {
+	if len(ciphertext) < node.nonceSize {
+		return nil, fmt.Errorf("Ciphertext too short.")
+	}
+	nonce := ciphertext[0:node.nonceSize]
+	msg := ciphertext[node.nonceSize:]
+	return node.gcm.Open(nil, nonce, msg, nil)
 }
 
 // each node watches for changes and notifies leader when relevant change occurs
@@ -494,6 +551,8 @@ func createNode(listenPort int, dataDirectory string) {
 	node.changeIgnore = make(map[string]bool)
 
 	node.dataDirectory = dataDirectory
+
+	initEncryption(node)
 
 	// go WatchTimer(node)
 	// go sendHeartbeatWhenLeader(node)
