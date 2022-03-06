@@ -54,6 +54,9 @@ type FileServerNode struct {
 	dataDirectory string
 	changeIgnore  map[string]bool
 
+	// stubbing
+	shouldStub bool
+
 	//encryption
 	gcm       cipher.AEAD
 	nonceSize int
@@ -608,7 +611,7 @@ func watchForChanges(node *FileServerNode) {
 						fil, _ := os.Stat(event.Name)
 						// if its less than a megabyte, send
 						println("filesize", fil.Size())
-						if fil.Size() < 1048576 {
+						if fil.Size() < 1048576 || !node.shouldStub {
 							println("sending full file")
 							sendFile(node, event.Name)
 						} else {
@@ -653,6 +656,9 @@ func createNode(listenPort int, dataDirectory string) {
 			Index: 0,
 		},
 	}
+
+	// set to false to always send full files
+	node.shouldStub = true
 
 	node.changeIgnore = make(map[string]bool)
 
