@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -235,14 +236,22 @@ type FileMessage struct {
 	Data     []byte
 }
 
+func writeToDataDirectory(node *FileServerNode, fileName string, data []byte) bool {
+	filePath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, fileName)
+	ignoreNextChange(node, filePath)
+
+	writeErr := os.WriteFile(filePath, data, 0644)
+	if writeErr != nil {
+		println("Unable to write to file", filePath, writeErr)
+		return false
+	}
+
+	return true
+}
+
 func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) error {
 	println("received file - name", file.FileName, "data - ", string(file.Data))
 	*reply = 1
-
-	// os.Wr
-	filePath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, file.FileName)
-
-	ignoreNextChange(node, filePath)
 
 	decryptedData, decryptErr := decrypt(node, file.Data)
 	if decryptErr != nil {
@@ -250,31 +259,20 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 		println("Unable to decrypt data")
 	}
 
-	writeErr := os.WriteFile(filePath, decryptedData, 0644)
-	if writeErr != nil {
+	writeSuccess := writeToDataDirectory(node, file.FileName, decryptedData)
+	if !writeSuccess {
 		*reply = 0
-		println("Unable to write to file", filePath, writeErr)
 	}
 
 	return nil
 
 }
 
-func sendFile(node *FileServerNode, fileName string) {
-
-	var readErr error
+func sendFileData(node *FileServerNode, fileName string, data []byte) {
 	var message = FileMessage{
 		FileName: getRelativeFileName(node, fileName),
+		Data:     encrypt(node, data),
 	}
-
-	// read file contents
-	rawFileData, readErr := os.ReadFile(fileName)
-	if readErr != nil {
-		println("UNABLE TO READ FILE", fileName)
-		return
-	}
-
-	message.Data = encrypt(node, rawFileData)
 
 	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
 	if httpError != nil {
@@ -290,24 +288,119 @@ func sendFile(node *FileServerNode, fileName string) {
 	}
 }
 
+func sendFile(node *FileServerNode, fileName string) {
+	// read file contents
+	rawFileData, readErr := os.ReadFile(fileName)
+	if readErr != nil {
+		println("UNABLE TO READ FILE", fileName)
+		return
+	}
+
+	sendFileData(node, fileName, rawFileData)
+}
+
+func sendFileStub(node *FileServerNode, fileName string) {
+	stubData := []byte("file stub for fMitosis file larger than 1mb")
+
+	sendFileData(node, fmt.Sprintf("%s.fmit", fileName), stubData)
+}
+
 func getRelativeFileName(node *FileServerNode, filename string) string {
 	return strings.Replace(filename, node.dataDirectory+"/", "", 1)
+}
+
+func (node *FileServerNode) RequestDowloadFullFile(stubName string, reply *int) error {
+	println("attempting to download full file", stubName)
+
+	*reply = 1
+
+	fileName := stubName[:len(stubName)-5]
+
+	// download file
+	message := FileMessage{}
+
+	client, httpError := rpc.DialHTTP("tcp", "localhost:9001")
+	if httpError != nil {
+		println("could not communicate with node - ")
+		return httpError
+	}
+
+	receiveErr := client.Call("FileServerNode.FileDownload", fileName, &message)
+	if receiveErr != nil {
+		println("error while sending file", receiveErr.Error())
+		return receiveErr
+	}
+
+	// write the new file
+	writeSuccess := writeToDataDirectory(node, fileName, message.Data)
+	if !writeSuccess {
+		*reply = 0
+		return nil
+	}
+
+	// remove file stub
+	stubPath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, stubName)
+	println("remove stub", stubPath)
+
+	ignoreNextChange(node, stubPath)
+
+	removeStubSuccess := os.Remove(stubPath)
+	if removeStubSuccess != nil {
+		*reply = 0
+		println("unable to remove", stubPath)
+		return removeStubSuccess
+	}
+
+	return nil
+}
+
+func (node *FileServerNode) FileDownload(fileName string, reply *FileMessage) error {
+	println("serving", fileName)
+
+	message := FileMessage{
+		FileName: fileName,
+	}
+
+	filePath := fmt.Sprintf("%s/%s", node.dataDirectory, fileName)
+
+	var readErr error
+	message.Data, readErr = os.ReadFile(filePath)
+	if readErr != nil {
+		println("unable to read file ", filePath)
+		return readErr
+	}
+
+	*reply = message
+
+	return nil
 }
 
 func (node *FileServerNode) ReceiveDeleteFile(fileName string, reply *int) error {
 	println("deleting file at", fileName)
 
 	*reply = 1
+	baseFileName := strings.Replace(fileName, ".fmit", "", 1)
 
-	// os.Wr
-	filePath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, fileName)
+	filePath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, baseFileName)
+	stubPath := fmt.Sprintf("%s%c%s.fmit", node.dataDirectory, os.PathSeparator, baseFileName)
 
-	ignoreNextChange(node, filePath)
+	toDelete := ""
 
-	deleteErr := os.Remove(filePath)
-	if deleteErr != nil {
-		*reply = 0
-		println("Unable to delete file", filePath, deleteErr.Error())
+	// of file exists
+	if _, err := os.Stat(filePath); err == nil {
+		toDelete = filePath
+	} else if _, err := os.Stat(stubPath); err == nil {
+		toDelete = stubPath
+	}
+
+	if len(toDelete) != 0 {
+		ignoreNextChange(node, toDelete)
+
+		deleteErr := os.Remove(toDelete)
+		if deleteErr != nil {
+			*reply = 0
+			println("Unable to delete file", toDelete, deleteErr.Error())
+		}
 	}
 
 	return nil
@@ -337,7 +430,6 @@ func (node *FileServerNode) ReceiveCreateDirectory(dir string, reply *int) error
 
 	*reply = 1
 
-	// os.Wr
 	dirPath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, dir)
 
 	ignoreNextChange(node, dirPath)
@@ -464,8 +556,8 @@ func watchForChanges(node *FileServerNode) {
 				// log.Println("event:", event)
 
 				// ignore all filename starting with .
-				if strings.HasPrefix(event.Name, ".") {
-					println("ignoring event for file", event.Name)
+				if strings.HasPrefix(filepath.Base(event.Name), ".") {
+					// println("ignoring event for file", event.Name)
 					continue
 				}
 
@@ -512,7 +604,18 @@ func watchForChanges(node *FileServerNode) {
 						watcher.Add(event.Name)
 						createDirectory(node, event.Name)
 					} else {
-						sendFile(node, event.Name)
+						// check size of file
+						fil, _ := os.Stat(event.Name)
+						// if its less than a megabyte, send
+						println("filesize", fil.Size())
+						if fil.Size() < 1048576 {
+							println("sending full file")
+							sendFile(node, event.Name)
+						} else {
+							println("sending stub")
+							// otherwise send just the stub
+							sendFileStub(node, event.Name)
+						}
 					}
 
 					// We add RPC functions to commit file change logs to leader
@@ -580,8 +683,6 @@ func main() {
 
 	listenPort := 9000
 	dataDir := ""
-
-	println(len(os.Args))
 
 	if len(os.Args) == 2 {
 		dataDir = os.Args[1]
