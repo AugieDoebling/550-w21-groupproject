@@ -160,6 +160,7 @@ func (n *FileServerNode) LeaderHeartbeat(heartbeat *Heartbeat, reply *int) error
 
 func (n *FileServerNode) AppendEntries(logs []EntryLog, reply *int) error {
 	latestNodeLog := n.logs[len(n.logs)-1]
+	// println("Log length:", len(logs))
 	if (latestNodeLog.Index + 1) == logs[0].Index {
 		n.logs = append(n.logs, logs...)
 		println("Recieved:", latestNodeLog.Index, latestNodeLog.Term, latestNodeLog.FileName, latestNodeLog.EventType, latestNodeLog.FileData)
@@ -195,9 +196,9 @@ func sendHeartbeat(n *FileServerNode, sendToNodeId int) {
 	hb.Term = n.term
 	hb.Leader_id = n.id
 
-	log := new(EntryLog)
-	log.Index = (n.logs[len(n.logs)-1].Index + 1)
-	log.Term = n.term
+	// log := new(EntryLog)
+	// log.Index = (n.logs[len(n.logs)-1].Index + 1)
+	// log.Term = n.term
 
 	clientErr := client.Call("FileServerNode.LeaderHeartbeat", hb, &res)
 	if clientErr != nil {
@@ -206,11 +207,14 @@ func sendHeartbeat(n *FileServerNode, sendToNodeId int) {
 	}
 	// n.logs = append(n.logs, *log)
 
-	println("Leader: ", n.logs[len(n.logs)-1].Index, n.logs[len(n.logs)-1].Term, n.logs[len(n.logs)-1].FileName, n.logs[len(n.logs)-1].FileData, n.logs[len(n.logs)-1].EventType)
-	rectificationLog := []EntryLog{}
+	// println("Leader: ", n.logs[len(n.logs)-1].Index, n.logs[len(n.logs)-1].Term, n.logs[len(n.logs)-1].FileName, n.logs[len(n.logs)-1].FileData, n.logs[len(n.logs)-1].EventType)
+	rectificationLog := []EntryLog{{
+		Term:  n.logs[len(n.logs)-1].Term,
+		Index: n.logs[len(n.logs)-1].Index,
+	}}
 	entriesErr := client.Call("FileServerNode.AppendEntries", n.logs, &res)
 	if entriesErr != nil {
-		rectificationLog = append(rectificationLog, *log)
+		// rectificationLog = append(rectificationLog, *log)
 		for i := len(n.logs) - 1; i >= 0; i-- {
 			sendErr := client.Call("FileServerNode.AppendEntries", rectificationLog, &res)
 			if sendErr == nil {
@@ -219,6 +223,7 @@ func sendHeartbeat(n *FileServerNode, sendToNodeId int) {
 			rectificationLog = append([]EntryLog{n.logs[i]}, rectificationLog...)
 		}
 	}
+	println("length of rectification:", len(rectificationLog))
 }
 
 func sendHeartbeatWhenLeader(node *FileServerNode) {
@@ -592,13 +597,19 @@ func decrypt(node *FileServerNode, ciphertext []byte) (plaintext []byte, err err
 // merge conflicts
 // file server capability - load balancer out of the leader
 
+var watcher *fsnotify.Watcher
+
 func watchForChanges(node *FileServerNode) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer watcher.Close()
+	println(getCurrentWorkingPath() + "/" + node.dataDirectory)
+	if err := filepath.Walk(getCurrentWorkingPath()+"/"+node.dataDirectory, watchDir); err != nil {
+		fmt.Println("ERROR", err)
+	}
 
+	defer watcher.Close()
 	done := make(chan bool)
 	go func() {
 		for {
@@ -779,4 +790,24 @@ func GetOutboundIP() net.IP {
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 
 	return localAddr.IP
+}
+
+func watchDir(path string, fi os.FileInfo, err error) error {
+
+	// since fsnotify can watch all the files in a directory, watchers only need
+	// to be added to each nested directory
+	if fi.Mode().IsDir() {
+		return watcher.Add(path)
+	}
+
+	return nil
+}
+
+func getCurrentWorkingPath() string {
+	path, err := os.Getwd()
+	if err != nil {
+		log.Println(err)
+	}
+	fmt.Println(path)
+	return path
 }
