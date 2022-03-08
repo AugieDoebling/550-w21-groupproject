@@ -19,7 +19,9 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const nodeCount = 3
+const nodeCount = 4
+
+var nodeAddresses = []string{"localhost:9000", "localhost:9001", "localhost:9002"}
 
 // raft node states
 const (
@@ -43,11 +45,11 @@ const (
 )
 
 type FileServerNode struct {
-	id               int
+	hostname         string
 	election_timeout int
 	status           int
 	term             int
-	leader_id        int
+	leader_id        string
 	timeout_ticker   time.Ticker
 	received_hb      bool
 	logs             []EntryLog
@@ -69,7 +71,7 @@ type EntryLog struct {
 	FilePath  string
 	FileData  []byte
 	EventType int
-	NodeID    int
+	NodeID    string
 	IpAddress net.IP
 
 	Term  int
@@ -78,7 +80,7 @@ type EntryLog struct {
 
 type Heartbeat struct {
 	Term      int
-	Leader_id int
+	Leader_id string
 }
 
 // rpc listener for vote request
@@ -105,16 +107,16 @@ func AnnounceCandidacy(n *FileServerNode) {
 	voteCount := 0
 	nodeResponses := nodeCount
 
-	for nid := 0; nid < nodeCount; nid++ {
+	for _, node := range nodeAddresses {
 		// Rather than sending RPC call to yourself, just vote for yourself.
-		if nid == n.id {
+		if node == n.hostname {
 			voteCount++
 			continue
 		}
 
-		client, httpError := rpc.DialHTTP("tcp", fmt.Sprintf("localhost:900%d", nid))
+		client, httpError := rpc.DialHTTP("tcp", node)
 		if httpError != nil {
-			println(nid, " - offline")
+			println(node, " - offline")
 			// println(" - node",  down")
 			nodeResponses -= 1
 			continue
@@ -126,7 +128,7 @@ func AnnounceCandidacy(n *FileServerNode) {
 			continue
 		}
 
-		println(nid, "voted", res)
+		println(node, "voted", res)
 
 		if res == VoteYes {
 			voteCount++
@@ -184,8 +186,8 @@ func WatchTimer(node *FileServerNode) {
 	}
 }
 
-func sendHeartbeat(n *FileServerNode, sendToNodeId int) {
-	client, httpError := rpc.DialHTTP("tcp", fmt.Sprintf("localhost:900%d", sendToNodeId))
+func sendHeartbeat(n *FileServerNode, sendToNode string) {
+	client, httpError := rpc.DialHTTP("tcp", sendToNode)
 	if httpError != nil {
 		// println(" - node down")
 		return
@@ -194,7 +196,7 @@ func sendHeartbeat(n *FileServerNode, sendToNodeId int) {
 
 	hb := new(Heartbeat)
 	hb.Term = n.term
-	hb.Leader_id = n.id
+	hb.Leader_id = n.hostname
 
 	// log := new(EntryLog)
 	// log.Index = (n.logs[len(n.logs)-1].Index + 1)
@@ -230,9 +232,8 @@ func sendHeartbeatWhenLeader(node *FileServerNode) {
 	for range time.Tick(50 * time.Millisecond) {
 		if node.status == Leader {
 			// print("sending heartbeats (term ", node.term, ") : ")
-			for i := 0; i < 8; i++ {
-				if i != node.id {
-					// print(i)
+			for _, i := range nodeAddresses {
+				if i != node.hostname {
 					go sendHeartbeat(node, i)
 				}
 			}
@@ -255,7 +256,7 @@ func writeToDataDirectory(node *FileServerNode, fileName string, data []byte) bo
 		FileName:  fileName,
 		FileData:  []byte(data),
 		EventType: Write,
-		NodeID:    node.id,
+		NodeID:    node.hostname,
 		IpAddress: node.IpAddress,
 		Term:      node.term,
 		Index:     len(node.logs) + 1,
@@ -286,7 +287,7 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 		FileName:  file.FileName,
 		FileData:  []byte(file.Data),
 		EventType: Write,
-		NodeID:    node.id,
+		NodeID:    node.hostname,
 		IpAddress: node.IpAddress,
 		Term:      node.term,
 		Index:     len(node.logs) + 1,
@@ -302,15 +303,21 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 
 }
 
-func sendFileData(node *FileServerNode, fileName string, data []byte) {
+func sendFileDataAll(node *FileServerNode, fileName string, data []byte) {
+	for _, dest := range nodeAddresses {
+		go sendFileData(node, fileName, data, dest)
+	}
+}
+
+func sendFileData(node *FileServerNode, fileName string, data []byte, nodeAddress string) {
 	var message = FileMessage{
 		FileName: getRelativeFileName(node, fileName),
 		Data:     encrypt(node, data),
 	}
 
-	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
+	client, httpError := rpc.DialHTTP("tcp", nodeAddress)
 	if httpError != nil {
-		println("could not communicate with node - ")
+		println("could not communicate with node - ", nodeAddress)
 		return
 	}
 	res := 0
@@ -320,7 +327,7 @@ func sendFileData(node *FileServerNode, fileName string, data []byte) {
 		FileName:  fileName,
 		FileData:  []byte(message.FileName),
 		EventType: Write,
-		NodeID:    node.id,
+		NodeID:    node.hostname,
 		IpAddress: node.IpAddress,
 		Term:      node.term,
 		Index:     len(node.logs) + 1,
@@ -343,13 +350,13 @@ func sendFile(node *FileServerNode, fileName string) {
 		return
 	}
 
-	sendFileData(node, fileName, rawFileData)
+	sendFileDataAll(node, fileName, rawFileData)
 }
 
 func sendFileStub(node *FileServerNode, fileName string) {
 	stubData := []byte("file stub for fMitosis file larger than 1mb")
 
-	sendFileData(node, fmt.Sprintf("%s.fmit", fileName), stubData)
+	sendFileDataAll(node, fmt.Sprintf("%s.fmit", fileName), stubData)
 }
 
 func getRelativeFileName(node *FileServerNode, filename string) string {
@@ -366,9 +373,9 @@ func (node *FileServerNode) RequestDowloadFullFile(stubName string, reply *int) 
 	// download file
 	message := FileMessage{}
 
-	client, httpError := rpc.DialHTTP("tcp", "localhost:9001")
+	client, httpError := rpc.DialHTTP("tcp", node.leader_id)
 	if httpError != nil {
-		println("could not communicate with node - ")
+		println("could not communicate with node - ", node.leader_id)
 		return httpError
 	}
 
@@ -453,13 +460,19 @@ func (node *FileServerNode) ReceiveDeleteFile(fileName string, reply *int) error
 	return nil
 }
 
-func deleteFile(node *FileServerNode, fileName string) {
+func deleteFileAll(node *FileServerNode, fileName string) {
+	for _, dest := range nodeAddresses {
+		go deleteFile(node, fileName, dest)
+	}
+}
+
+func deleteFile(node *FileServerNode, fileName string, destAddress string) {
 
 	relativeFileName := getRelativeFileName(node, fileName)
 
-	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
+	client, httpError := rpc.DialHTTP("tcp", destAddress)
 	if httpError != nil {
-		println("could not communicate with node - ")
+		println("could not communicate with node - ", destAddress)
 		return
 	}
 	res := 0
@@ -469,7 +482,7 @@ func deleteFile(node *FileServerNode, fileName string) {
 		FileName:  fileName,
 		FileData:  []byte{},
 		EventType: Delete,
-		NodeID:    node.id,
+		NodeID:    node.hostname,
 		IpAddress: node.IpAddress,
 		Term:      node.term,
 		Index:     len(node.logs) + 1,
@@ -503,10 +516,16 @@ func (node *FileServerNode) ReceiveCreateDirectory(dir string, reply *int) error
 	return nil
 }
 
-func createDirectory(node *FileServerNode, dir string) {
+func createDirectoryAll(node *FileServerNode, dir string) {
+	for _, dest := range nodeAddresses {
+		go createDirectory(node, dir, dest)
+	}
+}
+
+func createDirectory(node *FileServerNode, dir string, destintation string) {
 	relativeDirName := getRelativeFileName(node, dir)
 
-	client, httpError := rpc.DialHTTP("tcp", "localhost:9002")
+	client, httpError := rpc.DialHTTP("tcp", destintation)
 	if httpError != nil {
 		println("could not communicate with node - ")
 		return
@@ -600,7 +619,8 @@ func decrypt(node *FileServerNode, ciphertext []byte) (plaintext []byte, err err
 var watcher *fsnotify.Watcher
 
 func watchForChanges(node *FileServerNode) {
-	watcher, err := fsnotify.NewWatcher()
+	var err error
+	watcher, err = fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -637,7 +657,7 @@ func watchForChanges(node *FileServerNode) {
 				}
 
 				if event.Op&fsnotify.Rename == fsnotify.Rename {
-					deleteFile(node, event.Name)
+					deleteFileAll(node, event.Name)
 					continue
 				}
 
@@ -649,7 +669,7 @@ func watchForChanges(node *FileServerNode) {
 				}
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
 					println("*** DELETE -", event.Name)
-					deleteFile(node, event.Name)
+					deleteFileAll(node, event.Name)
 					// We need to check if the path is outside working directory
 					// fileStat, err := os.Stat(event.Name)
 					// if err != nil {
@@ -672,7 +692,7 @@ func watchForChanges(node *FileServerNode) {
 					fmt.Println("Is Directory: ", fileStat.IsDir())
 					if fileStat.IsDir() {
 						watcher.Add(event.Name)
-						createDirectory(node, event.Name)
+						createDirectoryAll(node, event.Name)
 					} else {
 						// check size of file
 						fil, _ := os.Stat(event.Name)
@@ -707,14 +727,15 @@ func watchForChanges(node *FileServerNode) {
 	<-done
 }
 
-func createNode(listenPort int, dataDirectory string) {
+func createNode(listenPort int, dataDirectory string, hostname string) {
 	node := new(FileServerNode)
 	node.status = Follower
 	if listenPort == 9000 {
 		node.status = Leader
 	}
+	node.hostname = hostname
 	// set the leader as uninitialized
-	node.leader_id = -1
+	node.leader_id = ""
 	// set the election timeout
 	node.election_timeout = rand.Intn(3000-1500) + 1500
 	// start the timer
@@ -764,20 +785,20 @@ func main() {
 
 	listenPort := 9000
 	dataDir := ""
+	hostname := ""
 
-	if len(os.Args) == 2 {
-		dataDir = os.Args[1]
-	} else if len(os.Args) == 3 {
+	if len(os.Args) == 4 {
 		dataDir = os.Args[1]
 		listenPort, _ = strconv.Atoi(os.Args[2])
+		hostname = os.Args[3]
 	} else {
-		println("usage : go run filenode.go <data_directory> <listener_port>")
+		println("usage : go run filenode.go <data_directory> <listener_port> <hostname>")
 		os.Exit(0)
 	}
 
 	println("Starting node listening on port:", listenPort)
 	println("data directory : ", dataDir)
-	createNode(listenPort, dataDir)
+	createNode(listenPort, dataDir, hostname)
 }
 
 func GetOutboundIP() net.IP {
@@ -797,6 +818,7 @@ func watchDir(path string, fi os.FileInfo, err error) error {
 	// since fsnotify can watch all the files in a directory, watchers only need
 	// to be added to each nested directory
 	if fi.Mode().IsDir() {
+		println("watching directory", watcher)
 		return watcher.Add(path)
 	}
 
