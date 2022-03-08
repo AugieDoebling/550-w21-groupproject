@@ -19,7 +19,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const nodeCount = 4
+const nodeCount = 3
 
 var nodeAddresses = []string{"localhost:9000", "localhost:9001", "localhost:9002"}
 
@@ -162,16 +162,34 @@ func (n *FileServerNode) LeaderHeartbeat(heartbeat *Heartbeat, reply *int) error
 
 func (n *FileServerNode) AppendEntries(logs []EntryLog, reply *int) error {
 	latestNodeLog := n.logs[len(n.logs)-1]
-	// println("Log length:", len(logs))
-	if (latestNodeLog.Index + 1) == logs[0].Index {
+	// println("Log index:", len(n.logs))
+	// println(latestNodeLog.Index, logs[0].Index)
+	if (latestNodeLog.Index + 1) == logs[len(logs)-1].Index {
 		n.logs = append(n.logs, logs...)
 		println("Recieved:", latestNodeLog.Index, latestNodeLog.Term, latestNodeLog.FileName, latestNodeLog.EventType, latestNodeLog.FileData)
 		println("Log size:", len(n.logs))
+		for i := 0; i < len(logs); i++ {
+			PerformLogFileChanges(n, logs[i])
+		}
 	} else {
+		// println("Inconsistency found")
 		return rpc.ServerError("Inconsistency found, resend logs")
 	}
 	*reply = Ack
 	return nil
+}
+
+func PerformLogFileChanges(n *FileServerNode, log EntryLog) {
+	if log.EventType != Delete {
+		writeToDataDirectory(n, log.FileName, log.FileData)
+	} else {
+		ignoreNextChange(n, log.FileName)
+
+		deleteErr := os.Remove(log.FileName)
+		if deleteErr != nil {
+			println("Unable to delete file", log.FileName, deleteErr.Error())
+		}
+	}
 }
 
 func WatchTimer(node *FileServerNode) {
@@ -198,34 +216,27 @@ func sendHeartbeat(n *FileServerNode, sendToNode string) {
 	hb.Term = n.term
 	hb.Leader_id = n.hostname
 
-	// log := new(EntryLog)
-	// log.Index = (n.logs[len(n.logs)-1].Index + 1)
-	// log.Term = n.term
-
 	clientErr := client.Call("FileServerNode.LeaderHeartbeat", hb, &res)
 	if clientErr != nil {
 		fmt.Println("Error: FileServerNode.LeaderHeartbeat", clientErr)
 		return
 	}
-	// n.logs = append(n.logs, *log)
+	// println
+	println("Length of logs:", len(n.logs), n.logs[0].Index, n.logs[0].Term)
 
-	// println("Leader: ", n.logs[len(n.logs)-1].Index, n.logs[len(n.logs)-1].Term, n.logs[len(n.logs)-1].FileName, n.logs[len(n.logs)-1].FileData, n.logs[len(n.logs)-1].EventType)
-	rectificationLog := []EntryLog{{
-		Term:  n.logs[len(n.logs)-1].Term,
-		Index: n.logs[len(n.logs)-1].Index,
-	}}
-	entriesErr := client.Call("FileServerNode.AppendEntries", n.logs, &res)
-	if entriesErr != nil {
-		// rectificationLog = append(rectificationLog, *log)
-		for i := len(n.logs) - 1; i >= 0; i-- {
-			sendErr := client.Call("FileServerNode.AppendEntries", rectificationLog, &res)
-			if sendErr == nil {
-				break
-			}
-			rectificationLog = append([]EntryLog{n.logs[i]}, rectificationLog...)
-		}
-	}
-	println("length of rectification:", len(rectificationLog))
+	// rectificationLog := []EntryLog{n.logs[0]}
+	// entriesErr := client.Call("FileServerNode.AppendEntries", n.logs, &res)
+	// if entriesErr != nil {
+	// 	// rectificationLog = append(rectificationLog, *log)
+	// 	for i := 0; i <= len(n.logs)-1; i++ {
+	// 		sendErr := client.Call("FileServerNode.AppendEntries", rectificationLog, &res)
+	// 		if sendErr == nil {
+	// 			break
+	// 		}
+	// 		rectificationLog = append(rectificationLog, n.logs[i])
+	// 	}
+	// }
+	// println("length of rectification:", len(rectificationLog))
 }
 
 func sendHeartbeatWhenLeader(node *FileServerNode) {
@@ -304,6 +315,19 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 }
 
 func sendFileDataAll(node *FileServerNode, fileName string, data []byte) {
+	newEntryLog := EntryLog{
+		Id:        (len(node.logs)),
+		FileName:  fileName,
+		FileData:  []byte(data),
+		EventType: Write,
+		NodeID:    node.hostname,
+		IpAddress: node.IpAddress,
+		Term:      node.term,
+		Index:     len(node.logs) + 1,
+	}
+	node.logs = append(node.logs, newEntryLog)
+	println(len(node.logs))
+
 	for _, dest := range nodeAddresses {
 		go sendFileData(node, fileName, data, dest)
 	}
@@ -321,19 +345,6 @@ func sendFileData(node *FileServerNode, fileName string, data []byte, nodeAddres
 		return
 	}
 	res := 0
-
-	newEntryLog := EntryLog{
-		Id:        (len(node.logs)),
-		FileName:  fileName,
-		FileData:  []byte(message.FileName),
-		EventType: Write,
-		NodeID:    node.hostname,
-		IpAddress: node.IpAddress,
-		Term:      node.term,
-		Index:     len(node.logs) + 1,
-	}
-	node.logs = append(node.logs, newEntryLog)
-	println(len(node.logs))
 
 	receiveErr := client.Call("FileServerNode.ReceiveCreateFile", message, &res)
 	if receiveErr != nil || res != 1 {
@@ -624,8 +635,7 @@ func watchForChanges(node *FileServerNode) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	println(getCurrentWorkingPath() + "/" + node.dataDirectory)
-	if err := filepath.Walk(getCurrentWorkingPath()+"/"+node.dataDirectory, watchDir); err != nil {
+	if err := filepath.Walk(node.dataDirectory, watchDir); err != nil {
 		fmt.Println("ERROR", err)
 	}
 
@@ -720,19 +730,19 @@ func watchForChanges(node *FileServerNode) {
 		}
 	}()
 
-	err = watcher.Add(node.dataDirectory)
-	if err != nil {
-		log.Fatal(err)
-	}
+	// err = watcher.Add(node.dataDirectory)
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
 	<-done
 }
 
 func createNode(listenPort int, dataDirectory string, hostname string) {
 	node := new(FileServerNode)
 	node.status = Follower
-	if listenPort == 9000 {
-		node.status = Leader
-	}
+	// if listenPort == 9000 {
+	// node.status = Leader
+	// }
 	node.hostname = hostname
 	// set the leader as uninitialized
 	node.leader_id = ""
@@ -756,9 +766,6 @@ func createNode(listenPort int, dataDirectory string, hostname string) {
 	node.dataDirectory = dataDirectory
 
 	node.IpAddress = GetOutboundIP()
-
-	println(node.IpAddress)
-	println(node.IpAddress.To16().String())
 
 	initEncryption(node)
 
@@ -830,6 +837,5 @@ func getCurrentWorkingPath() string {
 	if err != nil {
 		log.Println(err)
 	}
-	fmt.Println(path)
 	return path
 }
