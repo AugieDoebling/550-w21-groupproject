@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"log"
 	"math/rand"
 	"net"
@@ -305,7 +306,10 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 
 func sendFileDataAll(node *FileServerNode, fileName string, data []byte) {
 	for _, dest := range nodeAddresses {
-		go sendFileData(node, fileName, data, dest)
+		if dest != node.hostname {
+			go sendFileData(node, fileName, data, dest)
+		}
+
 	}
 }
 
@@ -334,6 +338,8 @@ func sendFileData(node *FileServerNode, fileName string, data []byte, nodeAddres
 	}
 	node.logs = append(node.logs, newEntryLog)
 	println(len(node.logs))
+
+	println("sending file", fileName, "to", nodeAddress)
 
 	receiveErr := client.Call("FileServerNode.ReceiveCreateFile", message, &res)
 	if receiveErr != nil || res != 1 {
@@ -462,7 +468,9 @@ func (node *FileServerNode) ReceiveDeleteFile(fileName string, reply *int) error
 
 func deleteFileAll(node *FileServerNode, fileName string) {
 	for _, dest := range nodeAddresses {
-		go deleteFile(node, fileName, dest)
+		if dest != node.hostname {
+			go deleteFile(node, fileName, dest)
+		}
 	}
 }
 
@@ -518,7 +526,9 @@ func (node *FileServerNode) ReceiveCreateDirectory(dir string, reply *int) error
 
 func createDirectoryAll(node *FileServerNode, dir string) {
 	for _, dest := range nodeAddresses {
-		go createDirectory(node, dir, dest)
+		if dest != node.hostname {
+			go createDirectory(node, dir, dest)
+		}
 	}
 }
 
@@ -541,6 +551,7 @@ func createDirectory(node *FileServerNode, dir string, destintation string) {
 }
 
 func ignoreNextChange(node *FileServerNode, filePath string) {
+	println("ignoring next change", filePath)
 	node.changeIgnore[filePath] = true
 }
 
@@ -616,115 +627,112 @@ func decrypt(node *FileServerNode, ciphertext []byte) (plaintext []byte, err err
 // merge conflicts
 // file server capability - load balancer out of the leader
 
-var watcher *fsnotify.Watcher
-
-func watchForChanges(node *FileServerNode) {
-	var err error
-	watcher, err = fsnotify.NewWatcher()
+func watchPath(node *FileServerNode, path string) {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
-	println(getCurrentWorkingPath() + "/" + node.dataDirectory)
-	if err := filepath.Walk(getCurrentWorkingPath()+"/"+node.dataDirectory, watchDir); err != nil {
-		fmt.Println("ERROR", err)
-	}
+
+	println("New watcher watching", path)
+	watcher.Add(path)
 
 	defer watcher.Close()
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				// log.Println("event:", event)
-
-				// ignore all filename starting with .
-				if strings.HasPrefix(filepath.Base(event.Name), ".") {
-					// println("ignoring event for file", event.Name)
-					continue
-				}
-
-				// if not chmod
-				if event.Op&fsnotify.Chmod != fsnotify.Chmod {
-					if ignoreExists(node, event.Name) {
-						println("found ignore for ", event.Name)
-						continue
-					}
-					println("did not find ignore for", event.Name)
-
-				}
-
-				if event.Op&fsnotify.Rename == fsnotify.Rename {
-					deleteFileAll(node, event.Name)
-					continue
-				}
-
-				if event.Op&fsnotify.Write == fsnotify.Write {
-					// log.Println("modified file:", event.Name)
-					println("*** WRITE -", event.Name)
-					// We add RPC functions to commit file change logs to leader
-					sendFile(node, event.Name)
-				}
-				if event.Op&fsnotify.Remove == fsnotify.Remove {
-					println("*** DELETE -", event.Name)
-					deleteFileAll(node, event.Name)
-					// We need to check if the path is outside working directory
-					// fileStat, err := os.Stat(event.Name)
-					// if err != nil {
-					// 	log.Println(err)
-					// }
-
-				}
-				if event.Op&fsnotify.Create == fsnotify.Create {
-					println("*** CREATE -", event.Name)
-					fileStat, err := os.Stat(event.Name)
-					if err != nil {
-						log.Println(err)
-					}
-
-					// fmt.Println("File Name:", fileStat.Name())        // Base name of the file
-					// fmt.Println("Size:", fileStat.Size())             // Length in bytes for regular files
-					// fmt.Println("Permissions:", fileStat.Mode())      // File mode bits
-					// fmt.Println("Last Modified:", fileStat.ModTime()) // Last modification time
-
-					fmt.Println("Is Directory: ", fileStat.IsDir())
-					if fileStat.IsDir() {
-						watcher.Add(event.Name)
-						createDirectoryAll(node, event.Name)
-					} else {
-						// check size of file
-						fil, _ := os.Stat(event.Name)
-						// if its less than a megabyte, send
-						println("filesize", fil.Size())
-						if fil.Size() < 1048576 || !node.shouldStub {
-							println("sending full file")
-							sendFile(node, event.Name)
-						} else {
-							println("sending stub")
-							// otherwise send just the stub
-							sendFileStub(node, event.Name)
-						}
-					}
-
-					// We add RPC functions to commit file change logs to leader
-				}
-
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Println("error:", err)
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
 			}
-		}
-	}()
+			// log.Println("event:", event)
 
-	err = watcher.Add(node.dataDirectory)
-	if err != nil {
-		log.Fatal(err)
+			// ignore all filename starting with .
+			if strings.HasPrefix(filepath.Base(event.Name), ".") {
+				// println("ignoring event for file", event.Name)
+				continue
+			}
+
+			// if not chmod
+			if event.Op&fsnotify.Chmod != fsnotify.Chmod {
+				if ignoreExists(node, event.Name) {
+					println("found ignore for ", event.Name)
+					continue
+				}
+				println("did not find ignore for", event.Name)
+
+			}
+
+			if event.Op&fsnotify.Rename == fsnotify.Rename {
+				deleteFileAll(node, event.Name)
+				continue
+			}
+
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				// log.Println("modified file:", event.Name)
+				println("*** WRITE -", event.Name)
+				// We add RPC functions to commit file change logs to leader
+				sendFile(node, event.Name)
+			}
+			if event.Op&fsnotify.Remove == fsnotify.Remove {
+				println("*** DELETE -", event.Name)
+				deleteFileAll(node, event.Name)
+				// We need to check if the path is outside working directory
+				// fileStat, err := os.Stat(event.Name)
+				// if err != nil {
+				// 	log.Println(err)
+				// }
+
+			}
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				println("*** CREATE -", event.Name)
+				fileStat, err := os.Stat(event.Name)
+				if err != nil {
+					log.Println(err)
+				}
+
+				// fmt.Println("File Name:", fileStat.Name())        // Base name of the file
+				// fmt.Println("Size:", fileStat.Size())             // Length in bytes for regular files
+				// fmt.Println("Permissions:", fileStat.Mode())      // File mode bits
+				// fmt.Println("Last Modified:", fileStat.ModTime()) // Last modification time
+
+				fmt.Println("Is Directory: ", fileStat.IsDir())
+				if fileStat.IsDir() {
+					createDirectoryAll(node, event.Name)
+					go watchPath(node, event.Name)
+				} else {
+					// check size of file
+					fil, _ := os.Stat(event.Name)
+					// if its less than a megabyte, send
+					println("filesize", fil.Size())
+					if fil.Size() < 1048576 || !node.shouldStub {
+						println("sending full file")
+						sendFile(node, event.Name)
+					} else {
+						println("sending stub")
+						// otherwise send just the stub
+						sendFileStub(node, event.Name)
+					}
+				}
+
+				// We add RPC functions to commit file change logs to leader
+			}
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Println("error:", err)
+		}
 	}
-	<-done
+
+}
+
+func watchForChanges(node *FileServerNode) {
+	filepath.WalkDir(node.dataDirectory, func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() {
+			go watchPath(node, path)
+		}
+		return nil
+	})
 }
 
 func createNode(listenPort int, dataDirectory string, hostname string) {
@@ -764,7 +772,7 @@ func createNode(listenPort int, dataDirectory string, hostname string) {
 
 	go WatchTimer(node)
 	go sendHeartbeatWhenLeader(node)
-	go watchForChanges(node)
+	watchForChanges(node)
 
 	rpc.Register(node)
 	rpc.HandleHTTP()
@@ -811,25 +819,4 @@ func GetOutboundIP() net.IP {
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 
 	return localAddr.IP
-}
-
-func watchDir(path string, fi os.FileInfo, err error) error {
-
-	// since fsnotify can watch all the files in a directory, watchers only need
-	// to be added to each nested directory
-	if fi.Mode().IsDir() {
-		println("watching directory", watcher)
-		return watcher.Add(path)
-	}
-
-	return nil
-}
-
-func getCurrentWorkingPath() string {
-	path, err := os.Getwd()
-	if err != nil {
-		log.Println(err)
-	}
-	fmt.Println(path)
-	return path
 }
