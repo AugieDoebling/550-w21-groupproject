@@ -803,7 +803,7 @@ func main() {
 	hostname := ""
 
 	if len(os.Args) == 4 {
-		dataDir = os.Args[1]
+		dataDir = strings.TrimSuffix(os.Args[1], "/")
 		listenPort, _ = strconv.Atoi(os.Args[2])
 		hostname = os.Args[3]
 	} else {
