@@ -57,6 +57,7 @@ type FileServerNode struct {
 	IpAddress        net.IP
 	dataDirectory    string
 	changeIgnore     map[string]bool
+	init_hb          bool
 
 	// stubbing
 	shouldStub bool
@@ -73,6 +74,7 @@ type EntryLog struct {
 	FileData  []byte
 	EventType int
 	NodeID    string
+	IsDir     bool
 	IpAddress net.IP
 
 	Term  int
@@ -154,35 +156,112 @@ func (n *FileServerNode) LeaderHeartbeat(heartbeat *Heartbeat, reply *int) error
 		n.term = heartbeat.Term
 		// mark that we've received a heartbeat this timeout cycle
 		n.received_hb = true
+		// println("Heartbeat receieved")
 		// println("received heartbeat from leader", heartbeat.Leader_id, heartbeat.Term)
+		if !n.init_hb {
+			InitializeNewNode(n)
+			n.init_hb = true
+		}
 	}
 
 	*reply = Ack
 	return nil
 }
 
-func (n *FileServerNode) AppendEntries(logs []EntryLog, reply *int) error {
-	latestNodeLog := n.logs[len(n.logs)-1]
-	// println("Log index:", len(n.logs))
-	// println(latestNodeLog.Index, logs[0].Index)
-	if (latestNodeLog.Index + 1) == logs[len(logs)-1].Index {
-		n.logs = append(n.logs, logs...)
-		println("Recieved:", latestNodeLog.Index, latestNodeLog.Term, latestNodeLog.FileName, latestNodeLog.EventType, latestNodeLog.FileData)
-		println("Log size:", len(n.logs))
-		for i := 0; i < len(logs); i++ {
-			PerformLogFileChanges(n, logs[i])
-		}
-	} else {
-		// println("Inconsistency found")
-		return rpc.ServerError("Inconsistency found, resend logs")
+func WriteToLeaderLog(event fsnotify.Event, node *FileServerNode) {
+	if node.status != Leader {
+		return
 	}
-	*reply = Ack
+	if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
+		rawFileData, readErr := os.ReadFile(event.Name)
+		if readErr != nil {
+			println("UNABLE TO READ FILE", event.Name)
+		}
+		fileStat, err := os.Stat(event.Name)
+		if err != nil {
+			log.Println(err)
+		}
+
+		fmt.Println("Is Directory: ", fileStat.IsDir())
+
+		println("File found:", event.Name)
+		parsedFileName := strings.Replace(event.Name, node.dataDirectory+"/", "", 1)
+		newEntryLog := EntryLog{
+			Id:        (len(node.logs)),
+			FileName:  parsedFileName,
+			FileData:  rawFileData,
+			EventType: Write,
+			NodeID:    node.hostname,
+			IpAddress: node.IpAddress,
+			Term:      node.term,
+			IsDir:     fileStat.IsDir(),
+			Index:     len(node.logs) + 1,
+		}
+		node.logs = append(node.logs, newEntryLog)
+	} else if event.Op&fsnotify.Remove == fsnotify.Remove {
+		parsedFileName := strings.Replace(event.Name, node.dataDirectory+"/", "", 1)
+		newEntryLog := EntryLog{
+			Id:        (len(node.logs)),
+			FileName:  parsedFileName,
+			FileData:  []byte{},
+			EventType: Delete,
+			NodeID:    node.hostname,
+			IpAddress: node.IpAddress,
+			Term:      node.term,
+			IsDir:     false,
+			Index:     len(node.logs) + 1,
+		}
+		node.logs = append(node.logs, newEntryLog)
+	}
+	println(len(node.logs))
+}
+
+func (n *FileServerNode) RequestLogs(requestingNode *FileServerNode, reply *[]EntryLog) error {
+	if n.status == Leader {
+		println(len(n.logs))
+		*reply = n.logs
+	}
+	return nil
+}
+
+func InitializeNewNode(node *FileServerNode) error {
+	if node.leader_id == "" {
+		// InitializeNewNode(node)
+		return nil
+	}
+	logs := []EntryLog{}
+	client, httpError := rpc.DialHTTP("tcp", node.leader_id)
+	if httpError != nil {
+		println("could not communicate with node - ", node.leader_id)
+		return httpError
+	}
+
+	receiveErr := client.Call("FileServerNode.RequestLogs", node, &logs)
+	if receiveErr != nil {
+		println("error while requesting logs", receiveErr.Error())
+		return receiveErr
+	}
+	println(len(logs))
+	println(logs)
+
+	for i := 0; i < len(logs); i++ {
+		PerformLogFileChanges(node, logs[i])
+	}
 	return nil
 }
 
 func PerformLogFileChanges(n *FileServerNode, log EntryLog) {
 	if log.EventType != Delete {
-		writeToDataDirectory(n, log.FileName, log.FileData)
+		if log.IsDir {
+			dirPath := fmt.Sprintf("%s%c%s", n.dataDirectory, os.PathSeparator, log.FileName)
+			ignoreNextChange(n, dirPath)
+			mkdirErr := os.Mkdir(dirPath, 0755)
+			if mkdirErr != nil {
+				println("Unable to create directory", dirPath, mkdirErr.Error())
+			}
+		} else {
+			writeToDataDirectory(n, log.FileName, log.FileData)
+		}
 	} else {
 		ignoreNextChange(n, log.FileName)
 
@@ -208,7 +287,7 @@ func WatchTimer(node *FileServerNode) {
 func sendHeartbeat(n *FileServerNode, sendToNode string) {
 	client, httpError := rpc.DialHTTP("tcp", sendToNode)
 	if httpError != nil {
-		// println(" - node down")
+
 		return
 	}
 	res := 0
@@ -222,22 +301,7 @@ func sendHeartbeat(n *FileServerNode, sendToNode string) {
 		fmt.Println("Error: FileServerNode.LeaderHeartbeat", clientErr)
 		return
 	}
-	// println
-	println("Length of logs:", len(n.logs), n.logs[0].Index, n.logs[0].Term)
 
-	// rectificationLog := []EntryLog{n.logs[0]}
-	// entriesErr := client.Call("FileServerNode.AppendEntries", n.logs, &res)
-	// if entriesErr != nil {
-	// 	// rectificationLog = append(rectificationLog, *log)
-	// 	for i := 0; i <= len(n.logs)-1; i++ {
-	// 		sendErr := client.Call("FileServerNode.AppendEntries", rectificationLog, &res)
-	// 		if sendErr == nil {
-	// 			break
-	// 		}
-	// 		rectificationLog = append(rectificationLog, n.logs[i])
-	// 	}
-	// }
-	// println("length of rectification:", len(rectificationLog))
 }
 
 func sendHeartbeatWhenLeader(node *FileServerNode) {
@@ -263,18 +327,6 @@ func writeToDataDirectory(node *FileServerNode, fileName string, data []byte) bo
 	filePath := fmt.Sprintf("%s%c%s", node.dataDirectory, os.PathSeparator, fileName)
 	ignoreNextChange(node, filePath)
 
-	newEntryLog := EntryLog{
-		Id:        (len(node.logs)),
-		FileName:  fileName,
-		FileData:  []byte(data),
-		EventType: Write,
-		NodeID:    node.hostname,
-		IpAddress: node.IpAddress,
-		Term:      node.term,
-		Index:     len(node.logs) + 1,
-	}
-	node.logs = append(node.logs, newEntryLog)
-
 	writeErr := os.WriteFile(filePath, data, 0644)
 	if writeErr != nil {
 		println("Unable to write to file", filePath, writeErr)
@@ -294,18 +346,6 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 		println("Unable to decrypt data")
 	}
 
-	newEntryLog := EntryLog{
-		Id:        (len(node.logs)),
-		FileName:  file.FileName,
-		FileData:  []byte(file.Data),
-		EventType: Write,
-		NodeID:    node.hostname,
-		IpAddress: node.IpAddress,
-		Term:      node.term,
-		Index:     len(node.logs) + 1,
-	}
-	node.logs = append(node.logs, newEntryLog)
-
 	writeSuccess := writeToDataDirectory(node, file.FileName, decryptedData)
 	if !writeSuccess {
 		*reply = 0
@@ -316,18 +356,6 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 }
 
 func sendFileDataAll(node *FileServerNode, fileName string, data []byte) {
-	newEntryLog := EntryLog{
-		Id:        (len(node.logs)),
-		FileName:  fileName,
-		FileData:  []byte(data),
-		EventType: Write,
-		NodeID:    node.hostname,
-		IpAddress: node.IpAddress,
-		Term:      node.term,
-		Index:     len(node.logs) + 1,
-	}
-	node.logs = append(node.logs, newEntryLog)
-	println(len(node.logs))
 
 	for _, dest := range nodeAddresses {
 		if dest != node.hostname {
@@ -350,24 +378,6 @@ func sendFileData(node *FileServerNode, fileName string, data []byte, nodeAddres
 	}
 	res := 0
 
-<<<<<<< HEAD
-=======
-	newEntryLog := EntryLog{
-		Id:        (len(node.logs)),
-		FileName:  fileName,
-		FileData:  []byte(message.FileName),
-		EventType: Write,
-		NodeID:    node.hostname,
-		IpAddress: node.IpAddress,
-		Term:      node.term,
-		Index:     len(node.logs) + 1,
-	}
-	node.logs = append(node.logs, newEntryLog)
-	println(len(node.logs))
-
-	println("sending file", fileName, "to", nodeAddress)
-
->>>>>>> 9bd876e42e7dd3f5570269c17b06d3984e4bd126
 	receiveErr := client.Call("FileServerNode.ReceiveCreateFile", message, &res)
 	if receiveErr != nil || res != 1 {
 		println("error while sending file")
@@ -512,18 +522,6 @@ func deleteFile(node *FileServerNode, fileName string, destAddress string) {
 	}
 	res := 0
 
-	newEntryLog := EntryLog{
-		Id:        (len(node.logs)),
-		FileName:  fileName,
-		FileData:  []byte{},
-		EventType: Delete,
-		NodeID:    node.hostname,
-		IpAddress: node.IpAddress,
-		Term:      node.term,
-		Index:     len(node.logs) + 1,
-	}
-	node.logs = append(node.logs, newEntryLog)
-
 	receiveErr := client.Call("FileServerNode.ReceiveDeleteFile", relativeFileName, &res)
 	if receiveErr != nil || res != 1 {
 		println("error while deleting file")
@@ -659,15 +657,9 @@ func watchPath(node *FileServerNode, path string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-<<<<<<< HEAD
-	if err := filepath.Walk(node.dataDirectory, watchDir); err != nil {
-		fmt.Println("ERROR", err)
-	}
-=======
 
 	println("New watcher watching", path)
 	watcher.Add(path)
->>>>>>> 9bd876e42e7dd3f5570269c17b06d3984e4bd126
 
 	defer watcher.Close()
 	for {
@@ -686,6 +678,7 @@ func watchPath(node *FileServerNode, path string) {
 
 			// if not chmod
 			if event.Op&fsnotify.Chmod != fsnotify.Chmod {
+				WriteToLeaderLog(event, node)
 				if ignoreExists(node, event.Name) {
 					println("found ignore for ", event.Name)
 					continue
@@ -749,13 +742,6 @@ func watchPath(node *FileServerNode, path string) {
 				// We add RPC functions to commit file change logs to leader
 			}
 
-<<<<<<< HEAD
-	// err = watcher.Add(node.dataDirectory)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	<-done
-=======
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
@@ -773,7 +759,6 @@ func watchForChanges(node *FileServerNode) {
 		}
 		return nil
 	})
->>>>>>> 9bd876e42e7dd3f5570269c17b06d3984e4bd126
 }
 
 func createNode(listenPort int, dataDirectory string, hostname string) {
@@ -792,7 +777,7 @@ func createNode(listenPort int, dataDirectory string, hostname string) {
 	// initialize empty logs
 	node.logs = []EntryLog{
 		{
-			Term:  0,
+			Term:  -1,
 			Index: 0,
 		},
 	}
@@ -806,15 +791,17 @@ func createNode(listenPort int, dataDirectory string, hostname string) {
 
 	node.IpAddress = GetOutboundIP()
 
+	node.init_hb = false
+
 	initEncryption(node)
 
 	go WatchTimer(node)
 	go sendHeartbeatWhenLeader(node)
 	watchForChanges(node)
-
 	rpc.Register(node)
 	rpc.HandleHTTP()
 	http.ListenAndServe(fmt.Sprintf(":%d", listenPort), nil)
+
 }
 
 // FS Notify to watch file changes
