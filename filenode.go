@@ -355,16 +355,6 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 
 }
 
-func sendFileDataAll(node *FileServerNode, fileName string, data []byte) {
-
-	for _, dest := range nodeAddresses {
-		if dest != node.hostname {
-			go sendFileData(node, fileName, data, dest)
-		}
-
-	}
-}
-
 func sendFileData(node *FileServerNode, fileName string, data []byte, nodeAddress string) {
 	var message = FileMessage{
 		FileName: getRelativeFileName(node, fileName),
@@ -393,13 +383,23 @@ func sendFile(node *FileServerNode, fileName string) {
 		return
 	}
 
-	sendFileDataAll(node, fileName, rawFileData)
-}
-
-func sendFileStub(node *FileServerNode, fileName string) {
 	stubData := []byte("file stub for fMitosis file larger than 1mb")
 
-	sendFileDataAll(node, fmt.Sprintf("%s.fmit", fileName), stubData)
+	fil, _ := os.Stat(fileName)
+	// if its less than a megabyte, send
+	println("filesize", fil.Size())
+
+	for _, dest := range nodeAddresses {
+		if dest == node.hostname {
+			continue
+		}
+
+		if dest == node.leader_id || fil.Size() < 1048576 || !node.shouldStub {
+			go sendFileData(node, fileName, rawFileData, dest)
+		} else {
+			go sendFileData(node, fmt.Sprintf("%s.fmit", fileName), stubData, dest)
+		}
+	}
 }
 
 func getRelativeFileName(node *FileServerNode, filename string) string {
@@ -725,18 +725,7 @@ func watchPath(node *FileServerNode, path string) {
 					createDirectoryAll(node, event.Name)
 					go watchPath(node, event.Name)
 				} else {
-					// check size of file
-					fil, _ := os.Stat(event.Name)
-					// if its less than a megabyte, send
-					println("filesize", fil.Size())
-					if fil.Size() < 1048576 || !node.shouldStub {
-						println("sending full file")
-						sendFile(node, event.Name)
-					} else {
-						println("sending stub")
-						// otherwise send just the stub
-						sendFileStub(node, event.Name)
-					}
+					sendFile(node, event.Name)
 				}
 
 				// We add RPC functions to commit file change logs to leader
@@ -764,9 +753,6 @@ func watchForChanges(node *FileServerNode) {
 func createNode(listenPort int, dataDirectory string, hostname string) {
 	node := new(FileServerNode)
 	node.status = Follower
-	// if listenPort == 9000 {
-	// node.status = Leader
-	// }
 	node.hostname = hostname
 	// set the leader as uninitialized
 	node.leader_id = ""
