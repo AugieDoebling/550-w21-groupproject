@@ -56,7 +56,7 @@ type FileServerNode struct {
 	logs             []EntryLog
 	IpAddress        net.IP
 	dataDirectory    string
-	changeIgnore     map[string]bool
+	changeIgnore     map[string]int64
 	init_hb          bool
 
 	// stubbing
@@ -241,8 +241,7 @@ func InitializeNewNode(node *FileServerNode) error {
 		println("error while requesting logs", receiveErr.Error())
 		return receiveErr
 	}
-	println(len(logs))
-	println(logs)
+	println("length of logs", len(logs))
 
 	for i := 0; i < len(logs); i++ {
 		PerformLogFileChanges(node, logs[i])
@@ -577,17 +576,13 @@ func createDirectory(node *FileServerNode, dir string, destintation string) {
 
 func ignoreNextChange(node *FileServerNode, filePath string) {
 	println("ignoring next change", filePath)
-	node.changeIgnore[filePath] = true
+	node.changeIgnore[filePath] = time.Now().UnixMilli() + 1000
 }
 
 func ignoreExists(node *FileServerNode, filePath string) bool {
-	ignore, present := node.changeIgnore[filePath]
+	ignoreUntil, present := node.changeIgnore[filePath]
 
-	if ignore {
-		node.changeIgnore[filePath] = false
-	}
-
-	return ignore && present
+	return present && time.Now().UnixMilli() < ignoreUntil
 }
 
 // encryption
@@ -692,22 +687,6 @@ func watchPath(node *FileServerNode, path string) {
 				continue
 			}
 
-			if event.Op&fsnotify.Write == fsnotify.Write {
-				// log.Println("modified file:", event.Name)
-				println("*** WRITE -", event.Name)
-				// We add RPC functions to commit file change logs to leader
-				sendFile(node, event.Name)
-			}
-			if event.Op&fsnotify.Remove == fsnotify.Remove {
-				println("*** DELETE -", event.Name)
-				deleteFileAll(node, event.Name)
-				// We need to check if the path is outside working directory
-				// fileStat, err := os.Stat(event.Name)
-				// if err != nil {
-				// 	log.Println(err)
-				// }
-
-			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
 				println("*** CREATE -", event.Name)
 				fileStat, err := os.Stat(event.Name)
@@ -728,7 +707,24 @@ func watchPath(node *FileServerNode, path string) {
 					sendFile(node, event.Name)
 				}
 
+				continue
+			}
+
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				// log.Println("modified file:", event.Name)
+				println("*** WRITE -", event.Name)
 				// We add RPC functions to commit file change logs to leader
+				sendFile(node, event.Name)
+			}
+			if event.Op&fsnotify.Remove == fsnotify.Remove {
+				println("*** DELETE -", event.Name)
+				deleteFileAll(node, event.Name)
+				// We need to check if the path is outside working directory
+				// fileStat, err := os.Stat(event.Name)
+				// if err != nil {
+				// 	log.Println(err)
+				// }
+
 			}
 
 		case err, ok := <-watcher.Errors:
@@ -771,7 +767,7 @@ func createNode(listenPort int, dataDirectory string, hostname string) {
 	// set to false to always send full files
 	node.shouldStub = true
 
-	node.changeIgnore = make(map[string]bool)
+	node.changeIgnore = make(map[string]int64)
 
 	node.dataDirectory = dataDirectory
 
