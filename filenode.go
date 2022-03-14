@@ -24,6 +24,8 @@ const nodeCount = 3
 
 var nodeAddresses = []string{"localhost:9000", "localhost:9001", "localhost:9002"}
 
+const ignoreChangesForMillis = 500
+
 // raft node states
 const (
 	Follower  = 0
