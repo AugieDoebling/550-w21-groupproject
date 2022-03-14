@@ -318,7 +318,7 @@ func sendHeartbeatWhenLeader(node *FileServerNode) {
 }
 
 type FileMessage struct {
-	FileName string
+	FileName []byte
 	Data     []byte
 }
 
@@ -345,7 +345,13 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 		println("Unable to decrypt data")
 	}
 
-	writeSuccess := writeToDataDirectory(node, file.FileName, decryptedData)
+	decryptedFilename, decryptFileNameErr := decrypt(node, file.FileName)
+	if decryptFileNameErr != nil {
+		*reply = 0
+		println("Unable to decrypt file name")
+	}
+
+	writeSuccess := writeToDataDirectory(node, string(decryptedFilename), decryptedData)
 	if !writeSuccess {
 		*reply = 0
 	}
@@ -356,7 +362,7 @@ func (node *FileServerNode) ReceiveCreateFile(file FileMessage, reply *int) erro
 
 func sendFileData(node *FileServerNode, fileName string, data []byte, nodeAddress string) {
 	var message = FileMessage{
-		FileName: getRelativeFileName(node, fileName),
+		FileName: encrypt(node, []byte(getRelativeFileName(node, fileName))),
 		Data:     encrypt(node, data),
 	}
 
@@ -454,7 +460,7 @@ func (node *FileServerNode) FileDownload(fileName string, reply *FileMessage) er
 	println("serving", fileName)
 
 	message := FileMessage{
-		FileName: fileName,
+		FileName: encrypt(node, []byte(fileName)),
 	}
 
 	filePath := fmt.Sprintf("%s/%s", node.dataDirectory, fileName)
@@ -576,7 +582,7 @@ func createDirectory(node *FileServerNode, dir string, destintation string) {
 
 func ignoreNextChange(node *FileServerNode, filePath string) {
 	println("ignoring next change", filePath)
-	node.changeIgnore[filePath] = time.Now().UnixMilli() + 1000
+	node.changeIgnore[filePath] = time.Now().UnixMilli() + ignoreChangesForMillis
 }
 
 func ignoreExists(node *FileServerNode, filePath string) bool {
